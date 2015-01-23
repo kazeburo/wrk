@@ -2,6 +2,7 @@
 
 #include "wrk.h"
 #include "main.h"
+#include <sys/un.h>
 
 static struct config {
     struct addrinfo addr;
@@ -14,6 +15,7 @@ static struct config {
     bool     dynamic;
     char    *script;
     SSL_CTX *ctx;
+    char *path;
 } cfg;
 
 static struct {
@@ -90,42 +92,60 @@ int main(int argc, char **argv) {
         .ai_socktype = SOCK_STREAM
     };
 
-    if ((rc = getaddrinfo(host, service, &hints, &addrs)) != 0) {
-        const char *msg = gai_strerror(rc);
-        fprintf(stderr, "unable to resolve %s:%s %s\n", host, service, msg);
-        exit(1);
-    }
-
-    for (addr = addrs; addr != NULL; addr = addr->ai_next) {
-        int fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-        if (fd == -1) continue;
-        rc = connect(fd, addr->ai_addr, addr->ai_addrlen);
-        close(fd);
-        if (rc == 0) break;
-    }
-
-    if (addr == NULL) {
-        char *msg = strerror(errno);
-        fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
-        exit(1);
-    }
-
-    if (!strncmp("https", schema, 5)) {
-        if ((cfg.ctx = ssl_init()) == NULL) {
-            fprintf(stderr, "unable to initialize SSL\n");
-            ERR_print_errors_fp(stderr);
+    if ( cfg.path ) {
+        hints.ai_family = PF_UNIX;
+        int fd;
+        if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) ==  -1) {
+            char *msg = strerror(errno);
+            fprintf(stderr, "unable to create socket %s\n", msg);
             exit(1);
         }
-        sock.connect  = ssl_connect;
-        sock.close    = ssl_close;
-        sock.read     = ssl_read;
-        sock.write    = ssl_write;
-        sock.readable = ssl_readable;
+        struct sockaddr_un addr_un;
+        addr_un.sun_family = AF_UNIX;
+        strcpy(addr_un.sun_path, cfg.path);
+        if (connect(fd, (struct sockaddr *)&addr_un, sizeof(addr_un.sun_family)+sizeof(addr_un.sun_path)) == -1) {
+            char *msg = strerror(errno);
+            fprintf(stderr, "unable to connect to %s %s\n", cfg.path, msg);
+            exit(1);
+        }
+        close(fd);
+
+    } else {
+        if ((rc = getaddrinfo(host, service, &hints, &addrs)) != 0) {
+            const char *msg = gai_strerror(rc);
+            fprintf(stderr, "unable to resolve %s:%s %s\n", host, service, msg);
+            exit(1);
+        }
+        for (addr = addrs; addr != NULL; addr = addr->ai_next) {
+            int fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+            if (fd == -1) continue;
+            rc = connect(fd, addr->ai_addr, addr->ai_addrlen);
+            close(fd);
+            if (rc == 0) break;
+        }
+        if (addr == NULL) {
+            char *msg = strerror(errno);
+            fprintf(stderr, "unable to connect to %s:%s %s\n", host, service, msg);
+            exit(1);
+        }
+
+        if (!strncmp("https", schema, 5)) {
+            if ((cfg.ctx = ssl_init()) == NULL) {
+                fprintf(stderr, "unable to initialize SSL\n");
+                ERR_print_errors_fp(stderr);
+                exit(1);
+            }
+            sock.connect  = ssl_connect;
+            sock.close    = ssl_close;
+            sock.read     = ssl_read;
+            sock.write    = ssl_write;
+            sock.readable = ssl_readable;
+        }
+        cfg.addr = *addr;
     }
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
-    cfg.addr = *addr;
 
     pthread_mutex_init(&statistics.mutex, NULL);
     statistics.latency  = stats_alloc(SAMPLES);
@@ -273,22 +293,38 @@ void *thread_main(void *arg) {
     return NULL;
 }
 
+
 static int connect_socket(thread *thread, connection *c) {
     struct addrinfo addr = cfg.addr;
     struct aeEventLoop *loop = thread->loop;
     int fd, flags;
+    struct sockaddr_un addr_un;
+    if ( cfg.path ) {
 
-    fd = socket(addr.ai_family, addr.ai_socktype, addr.ai_protocol);
+        if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
+            goto error;
+        }
+        flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        addr_un.sun_family = AF_UNIX;
+        strcpy(addr_un.sun_path, cfg.path);
+        if (connect(fd, (struct sockaddr *)&addr_un, sizeof(addr_un.sun_family)+sizeof(addr_un.sun_path)) == -1) {
+            if (errno != EINPROGRESS) goto error;
+        }
+    } else {
+        fd = socket(addr.ai_family, addr.ai_socktype, addr.ai_protocol);
 
-    flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    if (connect(fd, addr.ai_addr, addr.ai_addrlen) == -1) {
-        if (errno != EINPROGRESS) goto error;
+        if (connect(fd, addr.ai_addr, addr.ai_addrlen) == -1) {
+            if (errno != EINPROGRESS) goto error;
+        }
+
+        flags = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
     }
-
-    flags = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
+    
 
     flags = AE_READABLE | AE_WRITABLE;
     if (aeCreateFileEvent(loop, fd, flags, socket_connected, c) == AE_OK) {
@@ -561,7 +597,7 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:P:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -577,6 +613,9 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
                 break;
             case 'H':
                 *header++ = optarg;
+                break;
+            case 'P':
+                cfg->path = optarg;
                 break;
             case 'L':
                 cfg->latency = true;
