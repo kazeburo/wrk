@@ -3,6 +3,7 @@
 #include "wrk.h"
 #include "script.h"
 #include "main.h"
+#include <sys/un.h>
 
 static struct config {
     uint64_t connections;
@@ -15,6 +16,7 @@ static struct config {
     bool     latency;
     char    *script;
     SSL_CTX *ctx;
+    char *path;
 } cfg;
 
 static struct {
@@ -234,18 +236,31 @@ static int connect_socket(thread *thread, connection *c) {
     struct addrinfo *addr = thread->addr;
     struct aeEventLoop *loop = thread->loop;
     int fd, flags;
+    struct sockaddr_un addr_un;
+    if ( cfg.path ) {
+        if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
+            goto error;
+        }
+        flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        addr_un.sun_family = AF_UNIX;
+        strcpy(addr_un.sun_path, cfg.path);
+        if (connect(fd, (struct sockaddr *)&addr_un, sizeof(addr_un.sun_family)+sizeof(addr_un.sun_path)) == -1) {
+            if (errno != EINPROGRESS) goto error;
+        }
+    } else {
+        fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
 
-    fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (connect(fd, addr->ai_addr, addr->ai_addrlen) == -1) {
+            if (errno != EINPROGRESS) goto error;
+        }
 
-    if (connect(fd, addr->ai_addr, addr->ai_addrlen) == -1) {
-        if (errno != EINPROGRESS) goto error;
+        flags = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
     }
-
-    flags = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof(flags));
 
     flags = AE_READABLE | AE_WRITABLE;
     if (aeCreateFileEvent(loop, fd, flags, socket_connected, c) == AE_OK) {
@@ -484,7 +499,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:P:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -500,6 +515,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'H':
                 *header++ = optarg;
+                break;
+            case 'P':
+                cfg->path = optarg;
                 break;
             case 'L':
                 cfg->latency = true;
